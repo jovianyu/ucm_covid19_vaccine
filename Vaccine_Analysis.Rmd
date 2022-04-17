@@ -1,0 +1,1585 @@
+---
+title: "COVID-19 Vaccine Analysis"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 1800px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(tidyr)
+library(lubridate)
+library(scales)
+library(reshape2)
+library(drc)
+library(readxl)
+library(ggplot2)
+library(ggpmisc)
+library(grid)
+library(gridExtra)
+library(ggpubr)
+library(patchwork)
+library(janitor)
+
+WORK_DIR <- "."
+
+dir.create(paste0(WORK_DIR, "/output"), showWarnings = FALSE)
+dir.create(paste0(WORK_DIR, "/output/data"), showWarnings = FALSE)
+dir.create(paste0(WORK_DIR, "/output/figures"), showWarnings = FALSE)
+
+
+setwd(paste0(WORK_DIR, "/input/data/"))
+# REDCap Output
+source("REDCAP.R - REDACTED")
+setwd("../../")
+tib_redcap <- data %>%
+  as_tibble() %>%
+  mutate(record_id = str_remove(record_id, "-"))
+rm(data)
+WORK_DIR <- "./"
+
+# Basic non-PHI customization, including by-group color choices and figure
+# values pulled from Google Sheets. Redacted actual URLs.
+
+tib_demo <- googlesheets4::read_sheet(
+  "SPREADSHEET",
+  range = "A2:AL153",
+  col_types = paste(
+      c(
+        "A ID" = "c",
+        "B:E D1" = "-DDD",
+        "F:J D2" = "DDDDD",
+        "K:O Timepoints" = "-----",
+        "P:V blank" = "-------",
+        "W-AA ED, prior inf" = "cccDc",
+        "AB:AC cat" = "cc",
+        "AD Ab resp" = "c",
+        "AE:AG Ca info" = "ccc",
+        "AH:AL Notes" = "ccc-c"
+      ),
+      collapse = ""
+    )
+  ) %>%
+  mutate(ID = str_remove(ID, "-")) %>%
+  filter(!is.na(ID))
+
+tib_colors <- googlesheets4::read_sheet(
+  "SPREADSHEET",
+  sheet = 2, col_types = c("cc-")
+  )
+vec_colors <- tib_colors$Color
+names(vec_colors) <- tib_colors$Category
+tib_subcolors <- googlesheets4::read_sheet(
+  "SPREADSHEET",
+  sheet = 3, col_types = c("ccc")
+  ) %>%
+  mutate(Merged = paste(Category, Subcategory, sep = " - "))
+vec_subcolors <- tib_subcolors$Colors
+names(vec_subcolors) <- tib_subcolors$Merged
+
+vec_colors <- c(vec_colors, vec_subcolors)
+
+str_file_infx <- paste0(WORK_DIR, "REDACTED")
+tib_demo_mainpaper <- readxl::read_excel(
+    str_file_infx,
+    range = "A2:B77",
+    col_names = c("patient", "cohort"),
+    col_types = "text"
+  ) %>%
+  left_join(
+    readxl::read_excel(
+      str_file_infx,
+      sheet = 2,
+      range = "A2:B716",
+      col_names = c("patient", "d0"),
+      col_types = c("text", "date")
+    )
+  ) %>%
+  filter(!grepl("exclude", cohort, ignore.case = TRUE)) %>%
+  mutate(
+    d0 = as_date(d0),
+    `Analysis category` = case_when(
+        grepl("Cancer", cohort) ~ "Post-Infection Cancer",
+        TRUE ~ "Post-Infection Non-Cancer"
+      ),
+    patient = str_remove_all(patient, "-")
+  ) %>%
+  dplyr::select(patient, `Analysis category`, d0)
+
+
+tib_dob <- readxl::read_excel("REDACTED", col_types = c("text", "date", "text", "text", "text"))
+
+tib_ics <- readxl::read_excel("REDACTED") %>%
+  dplyr::select(ID = PtID, ICS_Date = `Sample date`, S_pep_CD4_total, S_pep_CD8_total) %>%
+  mutate(ID = str_remove(ID, "-"), ICS_Date = as_date(ICS_Date))
+
+get_file <- function(filename, ext = "p", out = TRUE) {
+  return(
+    sprintf(
+      "%s/%s/%s/%s.%s",
+      WORK_DIR,
+      ifelse(out, "output", "input"),
+      case_when(
+        ext == "x" ~ "data",
+        TRUE ~ "figures"
+      ),
+      filename,
+      case_when(
+        ext == "p" ~ "png",
+        ext == "pd" ~ "pdf",
+        ext == "x" ~ "xlsx"
+      )
+    )
+  )
+}
+
+fun_significance <- function(x){
+  case_when(
+    x < 0.0001 ~ "****",
+    x < 0.001 ~ "***",
+    x < 0.01 ~ "**",
+    x < 0.05 ~ "*",
+    TRUE  ~ "ns",
+  ) %>%
+    return()
+}
+
+N_W <- 10
+N_H <- 10
+
+INT_SIG_SIZE = 3
+
+load_elisa <- TRUE
+
+vec_lvls <- list(
+  "Analysis category" = c(
+      "HD",
+      "IO",
+      "Chemo",
+      "ChemoIO",
+      "B cell",
+      "TKI",
+      "Not on Tx"
+    ),
+  "Cancer Type" = c(
+    "HD",
+    "Breast/Gyn",
+    "GI",
+    "GU",
+    "H&N",
+    "Skin",
+    "Thoracic",
+    "Heme"
+  ),
+  "Post-Infection" = c(
+    "Post-Infection Non-Cancer",
+    "Post-Infection Cancer"
+  ),
+  "Group" = c(
+    "Post-Vaccination",
+    "Post-Infection"
+  )
+)
+
+fun_rename_lvls <- function(vec) {
+  str_remove(vec, "([0-9]|[A-B]) \\- ")
+}
+
+```
+
+```{r titer, include = F}
+estimate_titer <- function(dil, signal, cut.point){
+# ---------------------------------------------------------
+# Function to estimate titer give a dilution series
+#
+# dil: vector of dilution factors
+# signal: vector of signal intensity for dilutions
+# cut.point: signal cut point to use for titer estimation
+#
+# Returns a simple titer, a linearly interpolated titer,
+# and a status flag indicating data in range
+# ---------------------------------------------------------
+  log_dil <- log10(dil)
+  idx <- ! is.na(dil) & ! is.na(signal)
+  x <- dil[idx]
+  log_x <- log_dil[idx]
+  y <- signal[idx]
+  sort.idx <- sort.list(x)
+  x <- x[sort.idx]
+  log_x <- log_x[sort.idx]
+  y <- y[sort.idx]
+  
+  x.min <- min(x)
+  x.max <- max(x)
+  log_x.min <- min(log_x)
+  log_x.max <- max(log_x)
+  y.min <- min(y)
+  y.max <- max(y)
+  
+  titer <- NA
+  titer.lin.int <- NA
+  titer.4pl <- NA
+  titer.flag <- "Not estimable"
+  
+  if (y.max < cut.point | y[1] < cut.point){
+    titer.flag <- "Data < cut point"
+  }
+  else {
+    if (y.min > cut.point){
+      titer.flag <- "Data > cut point"
+    }
+    for(i in 1:(length(x) - 1)){
+      if (y[i] >= cut.point && y[i+1] < cut.point){
+        titer <- x[i]
+        titer.lin.int <- 10^(x[i+1] - (y[i+1] - cut.point) * (x[i+1] - x[i]) / (y[i+1] - y[i]))
+        
+        titer.flag <- "Data in range"
+        break
+      }
+    }
+    titer.4pl <- drm(
+      y ~ x,
+      fct = LL.4(names=c("Slope", "Lower", "Upper", "ED50")),
+      data = tibble(x[1:min(i+1, length(dil))], y[1:min(i+1, length(dil))])
+    ) %>%
+      ED(50, display = FALSE)
+    titer.4pl <- titer.4pl[,"Estimate"]
+    if(i == 1)
+      titer.4pl <- NA_real_
+  } 
+  
+  if(is.na(titer.4pl)) {
+    titer.4pl = 10
+  }
+
+  out <- list(titer         = titer,
+              titer.lin.int = titer.lin.int,
+              titer.4pl = titer.4pl,
+              titer.flag    = titer.flag)
+  return(out)
+}
+```
+
+```{r ELISA - Vaccine, echo = FALSE, results = 'asis', fig.cap = "\n", warning = FALSE, comment = FALSE, message = FALSE}
+if(load_elisa) {
+  tib_elisa_vaccine <- readxl::read_xlsx(get_file("elisa_vaccine", ext = "x"))
+} else {
+  xlsx <- get_file("REDACTED", ext = "x", out = FALSE)
+  get_rbdspike <- function(plate, xl = xlsx) {
+    print(sprintf("Starting plate %d...", plate))
+    get_od <- function(plate, rbd_spike) {
+      cn <- c("1a", "1b", "2a", "2b", "3a", "3b", "4a", "4b", "5a", "5b", "6a", "6b")
+      dilutions <- c(50, 150, 450, 1350, 4050, 36450, 328050, 1000000)
+      p <- (plate-1)*11+1
+      elisa_type <- case_when(
+        rbd_spike == "r" ~ "RBD",
+        rbd_spike == "s" ~ "Spike"
+      )
+      od <- readxl::read_excel(
+        xl,
+        sheet = ifelse(rbd_spike == "r", 2, 3),
+        range = paste0("B", p+2, ":M", p+9),
+        col_names = cn
+      )
+      samples <- readxl::read_excel(
+        xl,
+        sheet = 1,
+        range = paste0("B", p+2, ":E", p+2),
+        col_names = as.character(1:4)
+      ) %>%
+        as.matrix() %>%
+        unlist() %>%
+        sapply(
+          function(str)
+            str_replace(str, "^01-", "01") %>%
+            str_replace("^", "PT: ") %>%
+            str_replace("-", " ")
+        )
+      
+      od$rdil <- dilutions
+      od <- melt(od, id.vars = "rdil")
+      od$variable <- as.character(od$variable)
+      od$value <- od$value %>%
+        as.numeric() %>%
+        round(digits = 3)
+      
+      od$variable[grepl("^5[a|b]$", od$variable)] <- "POSITIVE"
+      od$variable[grepl("^6[a|b]$", od$variable)] <- "NEGATIVE"
+      for(i in 1:4) {
+        od$variable[grepl(paste0("^", i, "[a|b]$"), od$variable)] <- samples[i] %>%
+          as.character()
+      }
+      odstats <- od %>%
+        group_by(variable, rdil) %>%
+        summarise(
+          sd = sd(value, na.rm = T),
+          mean = mean(value),
+          .groups = "keep"
+        )
+      
+      odstats$variable <- gsub("[\r\n]", " ", odstats$variable)
+      odstats$variable <- as.factor(odstats$variable)
+      
+      od_colors <- brewer.pal(6, "Dark2")
+      names(od_colors) <- odstats$variable %>% unique() %>% sort()
+      
+      lineplot1 <- ggplot(data = odstats, aes(x = rdil, y = mean, group = variable, color = variable)) + 
+        geom_line() +
+        scale_color_manual(values = od_colors) +
+        ggtitle(elisa_type) +
+        theme_classic() +
+        theme(plot.title = element_text(hjust = 0.5), legend.title = element_blank()) +
+        ylab("O.D. 450") + 
+        geom_errorbar(aes(ymin = mean - sd, ymax = mean + sd), width = 0.1)  +
+        geom_point(size = 2) +
+        scale_x_log10("Reciprocal Dilution",
+              breaks = trans_breaks("log10", function(x) 10^x),
+              labels = trans_format("log10", math_format(10^.x))) +
+        scale_y_continuous(limits=c(0, 2), breaks=seq(0,1.5,0.5))
+  
+      cutoffs <- od %>%
+        filter(variable == "NEGATIVE") %>%
+        summarise(
+          mean = mean(value),
+          sd = sd(value, na.rm = T),
+          .groups = "keep"
+        )
+      cutoff <- cutoffs$mean + cutoffs$sd*3
+      odstats$norm <- odstats$mean / cutoff
+      #odstats$mean[odstats$rdil == 50 & odstats$variable == "NEGATIVE"]
+      
+      lineplot2 <- ggplot(data = odstats, aes(x = rdil, y = norm, group = variable, color = variable)) + 
+        geom_line() +
+        scale_color_manual(values = od_colors) +
+        ggtitle(sprintf("%s Normalized to Negative Control", elisa_type)) +
+        theme_classic() +
+        theme(plot.title = element_text(hjust = 0.5), legend.title = element_blank()) +
+        ylab("O.D. 450") + 
+        geom_hline(yintercept=1, linetype="dashed", color = "black") +
+        geom_point(size = 2) +
+        scale_x_log10("Reciprocal Dilution",
+              breaks = trans_breaks("log10", function(x) 10^x),
+              labels = trans_format("log10", math_format(10^.x))) 
+      titer <- data.frame(variable = character(), titer = numeric())
+      for(i in unique(odstats$variable)) {
+        d <- odstats[odstats$variable == i,]
+        titer.out <- estimate_titer(dil=d$rdil, signal=d$norm, cut.point=1.0)
+        newrow <- data.frame(variable = d[1,1], titer = titer.out$titer.4pl)
+        titer <- rbind(titer, newrow)
+      }
+      titer <- arrange(titer, variable)
+      barplot <- ggplot(data = titer, aes(x = variable, y = titer, fill = variable)) +
+        geom_bar(stat = "identity", na.rm = TRUE) +
+        scale_fill_manual(values = od_colors) +
+        ggtitle(sprintf("%s Titer", elisa_type)) +
+        theme_classic() +
+        theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(size = 0.1, angle = 45, hjust = 1), legend.title = element_blank()) +
+        xlab("Sample") +
+        ylab("Calculated Titer") +
+        scale_y_log10("Titer",
+                      breaks = trans_breaks("log10", function(x) 10^x),
+                      labels = trans_format("log10", math_format(10^.x)), limits=c(1, 1000000))
+      elisaplot <- lineplot1 / lineplot2 / barplot
+      return(list(titer, elisaplot))
+    }
+    
+    rbd <- get_od(plate, "r")
+    spike <- get_od(plate, "s")
+    ggsave(
+      get_file(paste0("QC_Vaccine_plate_", plate), ext = "p"),
+      (rbd[[2]]) | (spike[[2]]),
+      width = N_W,
+      height = N_H
+    )
+    
+    print(sprintf("Finished plate %d!", plate))
+    return(
+      full_join(
+        rbd[[1]],
+        spike[[1]],
+        by = "variable",
+        suffix = c("_rbd", "_spike")
+      ) %>%
+        mutate(plate = plate)
+    )
+  }
+  tib_elisa_vaccine <- bind_rows(lapply(c(1:52, 54:60), get_rbdspike))
+  
+  tib_elisa_vaccine <- tib_elisa_vaccine %>% 
+    filter(!grepl("POSITIVE|NEGATIVE", variable)) %>%
+    separate(variable, c("pt", "patient", "date"), sep = " ") %>%
+    dplyr::select(-pt) %>%
+    group_by(patient, date) %>%
+    filter(plate == max(plate))
+  tib_elisa_vaccine %>% 
+    writexl::write_xlsx(get_file("elisa_vaccine", ext = "x"))
+
+}
+```
+
+
+```{r ELISA - Post-Infection, echo = FALSE, results = 'asis', fig.cap = "\n", warning = FALSE, comment = FALSE, message = FALSE}
+if(load_elisa) {
+  tib_elisa_infection <- readxl::read_xlsx(get_file("elisa_infection", ext = "x"))
+} else {
+  xlsx <- get_file("REDACTED", ext = "x", out = FALSE)
+  get_rbdspike <- function(plate, xl = xlsx) {
+    print(sprintf("Starting plate %d...", plate))
+    get_od <- function(plate, rbd_spike) {
+      
+      cn <- c("1a", "1b", "2a", "2b", "3a", "3b", "4a", "4b", "5a", "5b", "6a", "6b")
+      dilutions <- c(50, 150, 450, 1350, 4050, 36450, 328050, 1000000)
+      p <- (plate-1)*11+2
+      elisa_type <- case_when(
+        rbd_spike == "r" ~ "RBD",
+        rbd_spike == "s" ~ "Spike"
+      )
+      dilutions <- readxl::read_excel(
+        xl,
+        sheet = ifelse(rbd_spike == "r", 1, 2),
+        range = paste0("A", p+2, ":A", p+9),
+        col_names = "dil"
+      ) %>%
+        drop_na() %>%
+        pull(dil)
+      od <- readxl::read_excel(
+        xl,
+        sheet = ifelse(rbd_spike == "r", 1, 2),
+        range = paste0("C", p+2, ":N", p+9),
+        col_names = cn
+      )
+      plate_name <- readxl::read_excel(
+        xl,
+        sheet = ifelse(rbd_spike == "r", 1, 2),
+        range = paste0("B", p-1),
+        col_names = "p"
+      )$p
+      
+      samples <- readxl::read_excel(
+        xl,
+        sheet = ifelse(rbd_spike == "r", 1, 2),
+        range = paste0("C", p-1, ":N", p-1),
+        col_names = cn
+      ) %>%
+        dplyr::select(all_of(cn[grepl("a", cn)])) %>%
+        as.matrix() %>%
+        unlist()
+      
+      dates <- readxl::read_excel(
+        xl,
+        sheet = ifelse(rbd_spike == "r", 1, 2),
+        range = paste0("C", p, ":N", p),
+        col_names = cn
+      ) %>%
+        dplyr::select(all_of(cn[grepl("a", cn)])) %>%
+        as.matrix() %>%
+        unlist() %>%
+        as.character() %>%
+        str_remove_all("-")
+      
+      sampledates <- mapply(paste, sep = "-", samples, dates)
+      names(sampledates) <- cn[grepl("a", cn)]
+      sampledates[grepl("positive", sampledates, ignore.case = TRUE)] <- "POSITIVE"
+      sampledates[grepl("negative", sampledates, ignore.case = TRUE)] <- "NEGATIVE"
+      sampledates[grepl("blank", sampledates, ignore.case = TRUE)] <- "EXCLUDE"
+      sampledates[grepl("EXCLUDE", sampledates)] <- mapply(paste, sep = "", "EXCLUDE", 1:sum(grepl("EXCLUDE", sampledates)))
+
+      od$rdil <- dilutions
+      od <- melt(od, id.vars = "rdil")
+      od$variable <- as.character(od$variable)
+      od$value <- od$value %>%
+        as.numeric() %>%
+        round(digits = 3)
+      
+      for(i in 1:6) {
+        od$variable[grepl(paste0("^", i, "[a|b]$"), od$variable)] <- sampledates[i] %>%
+          as.character()
+      }
+      odstats <- od %>%
+        group_by(variable, rdil) %>%
+        summarise(
+          sd = sd(value, na.rm = T),
+          mean = mean(value),
+          .groups = "keep"
+        )
+      
+      odstats$variable <- gsub("[\r\n]", " ", odstats$variable)
+      odstats$variable <- as.factor(odstats$variable)
+      
+      od_colors <- brewer.pal(6, "Dark2")
+      names(od_colors) <- odstats$variable %>% unique() %>% sort()
+      
+      lineplot1 <- ggplot(data = odstats, aes(x = rdil, y = mean, group = variable, color = variable)) + 
+        geom_line() +
+        scale_color_manual(values = od_colors) +
+        ggtitle(elisa_type) +
+        theme_classic() +
+        theme(plot.title = element_text(hjust = 0.5), legend.title = element_blank()) +
+        ylab("O.D. 450") + 
+        geom_errorbar(aes(ymin = mean - sd, ymax = mean + sd), width = 0.1)  +
+        geom_point(size = 2) +
+        scale_x_log10("Reciprocal Dilution",
+              breaks = trans_breaks("log10", function(x) 10^x),
+              labels = trans_format("log10", math_format(10^.x))) +
+        scale_y_continuous(limits=c(0, 2), breaks=seq(0,1.5,0.5))
+  
+      cutoffs <- od %>%
+        filter(variable == "NEGATIVE") %>%
+        summarise(
+          mean = mean(value),
+          sd = sd(value, na.rm = T),
+          .groups = "keep"
+        )
+      cutoff <- cutoffs$mean + cutoffs$sd*3
+      odstats$norm <- odstats$mean / cutoff
+      #odstats$mean[odstats$rdil == 50 & odstats$variable == "NEGATIVE"]
+      
+      lineplot2 <- ggplot(data = odstats, aes(x = rdil, y = norm, group = variable, color = variable)) + 
+        geom_line() +
+        scale_color_manual(values = od_colors) +
+        ggtitle(sprintf("%s Normalized to Negative Control", elisa_type)) +
+        theme_classic() +
+        theme(plot.title = element_text(hjust = 0.5), legend.title = element_blank()) +
+        ylab("O.D. 450") + 
+        geom_hline(yintercept=1, linetype="dashed", color = "black") +
+        geom_point(size = 2) +
+        scale_x_log10("Reciprocal Dilution",
+              breaks = trans_breaks("log10", function(x) 10^x),
+              labels = trans_format("log10", math_format(10^.x))) 
+      titer <- data.frame(variable = character(), titer = numeric())
+      for(i in unique(odstats$variable)) {
+        d <- odstats[odstats$variable == i,]
+        titer.out <- estimate_titer(dil=d$rdil, signal=d$norm, cut.point=1.0)
+        newrow <- data.frame(variable = d[1,1], titer = titer.out$titer.4pl)
+        titer <- rbind(titer, newrow)
+      }
+      titer <- arrange(titer, variable)
+      barplot <- ggplot(data = titer, aes(x = variable, y = titer, fill = variable)) +
+        geom_bar(stat = "identity", na.rm = TRUE) +
+        scale_fill_manual(values = od_colors) +
+        ggtitle(sprintf("%s Titer", elisa_type)) +
+        theme_classic() +
+        theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(size = 0.1, angle = 45, hjust = 1), legend.title = element_blank()) +
+        xlab("Sample") +
+        ylab("Calculated Titer") +
+        scale_y_log10("Titer",
+                      breaks = trans_breaks("log10", function(x) 10^x),
+                      labels = trans_format("log10", math_format(10^.x)), limits=c(1, 1000000))
+      elisaplot <- lineplot1 / lineplot2 / barplot
+      return(list(titer, elisaplot, plate_name))
+    }
+    
+    rbd <- get_od(plate, "r")
+    spike <- get_od(plate, "s")
+    ggsave(
+      get_file(paste0("QC_Infection_plate_", rbd[[3]]), ext = "p"),
+      (rbd[[2]]) | (spike[[2]]),
+      width = N_W,
+      height = N_H
+    )
+    
+    print(sprintf("Finished plate %s!", rbd[[3]]))
+    return(
+      full_join(
+        rbd[[1]],
+        spike[[1]],
+        by = "variable",
+        suffix = c("_rbd", "_spike")
+      ) %>%
+        mutate(plate = rbd[[3]])
+    )
+  }
+  tib_elisa_infection <- bind_rows(lapply(1:24, get_rbdspike))
+  
+  tib_elisa_infection <- tib_elisa_infection %>% 
+    filter(!grepl("POSITIVE|NEGATIVE|EXCLUDE|R", variable)) %>%
+    separate(variable, c("patient", "date"), sep = "-") %>%
+    group_by(patient, date) %>%
+    filter(plate == max(plate))
+  tib_elisa_infection %>% 
+    writexl::write_xlsx(get_file("elisa_infection", ext = "x"))
+
+}
+```
+
+```{r Reorganize Main Paper Data}
+tib_primary_infection <- tib_elisa_infection %>%
+  arrange(patient) %>%
+  mutate(date = as_date(date, format = "%Y%m%d")) %>%
+  bind_rows(
+    tib_elisa_vaccine %>%
+      filter(patient == "01498") %>%
+      mutate(date = as_date(date, format = "%m%d%y"), plate = as.character(plate))
+    ) %>%
+  inner_join(
+    tib_demo_mainpaper,
+    by = "patient"
+  ) %>%
+  rename(ID = patient, RBD = titer_rbd, Spike = titer_spike) %>%
+  mutate(DPO = date - d0)
+
+tib_primary_infection %>% 
+  writexl::write_xlsx(get_file("elisa_infection_included_w_dpo", ext = "x"))
+  
+```
+
+
+```{r}
+tib_primary_all <- tib_redcap %>%
+  filter(!is.na(eco)) %>% 
+  dplyr::select(ID = record_id, ECOG = eco) %>%
+  full_join(
+    tib_redcap %>%
+      filter(subject_dob != "") %>%
+      dplyr::select(ID = record_id, DOB = subject_dob) %>%
+      mutate(
+        DOB = ifelse(ID == "01611", "1963-12-26", DOB)
+      ) %>%
+      mutate(DOB = ymd(DOB)),
+    by = "ID"
+  ) %>%
+  full_join(
+    tib_redcap %>%
+      filter(!is.na(gender.factor)) %>%
+      dplyr::select(ID = record_id, Sex = gender.factor, Steroids = steroids.factor),
+    by = "ID"
+  ) %>%
+  full_join(
+    tib_redcap %>%
+      filter(!is.na(tx_line)) %>%
+      dplyr::select(ID = record_id, tx_line, tx_line.factor) %>%
+      group_by(ID) %>%
+      filter(tx_line == max(tx_line)),
+    by = "ID"
+  ) %>%
+  full_join(
+    tib_redcap %>%
+      filter(stage != "") %>%
+      dplyr::select(ID = record_id, stage),
+    by = "ID"
+  ) %>%
+  full_join(
+    tib_demo %>%
+      dplyr::select(
+        ID,
+        `Dose 1` = `First Dose`,
+        `Dose 2` = `2nd dose`,
+        `Dose 3` = `3rd dose`,
+        `Cancer Type` = `Cancer category`,
+        `Analysis category`,
+        `Analysis subcategory`,
+        `Pre-vaccine COVID infection`
+      ),
+    by = "ID"
+  ) %>%
+  full_join(
+    tib_dob %>%
+      dplyr::select(
+        ID,
+        DOB_HD = DOB,
+        Gender_HD = Gender,
+        ECOG_HD = ECOG,
+        Stage_HD = Stage
+      ),
+    by = "ID"
+  ) %>%
+  mutate(
+    Age = case_when(
+      !is.na(DOB_HD) ~ as.integer(time_length(difftime(`Dose 1`, DOB_HD), "years")),
+      is.na(`Dose 1`) | is.na(DOB) ~ NA_integer_,
+      TRUE ~ as.integer(time_length(difftime(`Dose 1`, DOB), "years"))
+    ),
+    Sex = case_when(
+      !is.na(Gender_HD) ~ Gender_HD,
+      TRUE ~ as.character(Sex)
+    ),
+    stage = case_when(
+      !is.na(Stage_HD) ~ Stage_HD,
+      TRUE ~ as.character(stage)
+    ),
+    ECOG = case_when(
+      !is.na(ECOG_HD) ~ ECOG_HD,
+      TRUE ~ as.character(ECOG)
+    ),
+    
+  ) %>%
+  right_join(
+    tib_elisa_vaccine %>%
+      mutate(
+        date = parse_date_time(date, "mdy")
+      ) %>%
+      dplyr::select(ID = patient, `ELISA Date` = date, RBD = titer_rbd, Spike = titer_spike),
+    by = "ID"
+  ) %>%
+  mutate(
+    ELISA_DPV = difftime(`ELISA Date`, `Dose 1`, units = "days"),
+    ELISA_DPV = ifelse(is.na(ELISA_DPV), difftime(`ELISA Date`, `Dose 2`, units = "days") + 30, ELISA_DPV)
+  ) %>%
+  filter(`Analysis category` != "EXCLUDE", `Cancer Type` != "EXCLUDE") %>%
+  mutate(
+    `Cancer Type` = case_when(
+      is.na(`Cancer Type`) ~ "HD",
+      TRUE ~ `Cancer Type`
+    ) %>% factor(levels = c("HD", "Breast/Gyn", "GI", "GU", "H&N", "Skin", "Thoracic", "Heme"))
+  ) %>%
+  unique() %>%
+  mutate(
+    `Dose 1` = as_date(`Dose 1`),
+    `Dose 2` = as_date(`Dose 2`),
+    `Dose 3` = as_date(`Dose 3`),
+    `ELISA Date` = as_date(`ELISA Date`),
+    `Analysis category` = fun_rename_lvls(`Analysis category`),
+    `Analysis SuperCategory` = case_when(
+      grepl("IO", `Analysis category`) ~ "IO",
+      grepl("TKI|Tx", `Analysis category`) ~ "TKI/Not on Tx",
+      grepl("B cell", `Analysis category`) ~ "B cell",
+      grepl("HD", `Analysis category`) ~ "HD",
+      grepl("Chemo", `Analysis category`) ~ "Chemo",
+      TRUE ~ "What"
+    ) %>% factor(levels = c("HD", "Chemo", "IO", "TKI/Not on Tx", "B cell")),
+    `Analysis subcategory` = fun_rename_lvls(`Analysis subcategory`),
+    `Analysis subcategory` = paste(`Analysis category`, `Analysis subcategory`, sep = " - ")
+  )
+
+tib_post_bl <- tib_primary_all %>%
+  filter(`ELISA Date` <= (`Dose 1`)) %>%
+  dplyr::select(
+    ID,
+    `Baseline Date` = `ELISA Date`,
+    `Baseline RBD` = RBD,
+    `Baseline Spike` = Spike
+  ) %>%
+  group_by(ID) %>%
+  filter(`Baseline Date` == min(`Baseline Date`))
+tib_post_d1 <- tib_primary_all %>%
+  filter(`ELISA Date` >= (`Dose 1` + 10), `ELISA Date` <= (`Dose 2`)) %>%
+  dplyr::select(
+    ID,
+    `Post-Dose 1 Date` = `ELISA Date`,
+    `Post-Dose 1 RBD` = RBD,
+    `Post-Dose 1 Spike` = Spike
+  ) %>%
+  group_by(ID) %>%
+  filter(`Post-Dose 1 Date` == min(`Post-Dose 1 Date`))
+tib_post_d2 <- tib_primary_all %>%
+  filter(`ELISA Date` >= (`Dose 2` + 7), (`ELISA Date` <= (`Dose 3`) | is.na(`Dose 3`))) %>%
+  dplyr::select(
+    ID,
+    `Post-Dose 2 Date` = `ELISA Date`,
+    `Post-Dose 2 RBD` = RBD,
+    `Post-Dose 2 Spike` = Spike
+  ) %>%
+  group_by(ID) %>%
+  filter(`Post-Dose 2 Date` == min(`Post-Dose 2 Date`)) %>%
+  filter(!(ID == "01568" & `Post-Dose 2 Date` == as_date("2021-04-13")))
+tib_post_d3 <- tib_primary_all %>%
+  filter(`ELISA Date` >= (`Dose 3` + 7)) %>%
+  dplyr::select(
+    ID,
+    `Post-Dose 3 Date` = `ELISA Date`,
+    `Post-Dose 3 RBD` = RBD,
+    `Post-Dose 3 Spike` = Spike
+  ) %>%
+  group_by(ID) %>%
+  filter(`Post-Dose 3 Date` == min(`Post-Dose 3 Date`))
+
+tib_primary <- tib_primary_all %>%
+  dplyr::select(-`ELISA Date`, -RBD, -Spike, -ELISA_DPV) %>%
+  unique() %>%
+  left_join(tib_post_bl, by = "ID") %>%
+  left_join(tib_post_d1, by = "ID") %>%
+  left_join(tib_post_d2, by = "ID") %>%
+  left_join(tib_post_d3, by = "ID") %>%
+  mutate(`Pre-vaccine COVID infection` = `Pre-vaccine COVID infection` == "YES")
+rm(tib_post_bl)
+rm(tib_post_d1)
+rm(tib_post_d2)
+rm(tib_post_d3)
+
+tib_ics <- readxl::read_excel(
+  get_file("REDACTED", "x", FALSE)
+)  %>%
+  dplyr::select(ID = PtID, ICS_Date = `Sample date`, S_pep_CD4_total, S_pep_CD8_total) %>%
+  mutate(ID = str_remove(ID, "-"), ICS_Date = as_date(ICS_Date))
+
+tib_elisa_ics <- tib_primary_all %>%
+  inner_join(tib_ics, by = c("ID" = "ID", "ELISA Date" = "ICS_Date"))
+
+tib_primary_noinfx <- tib_primary %>%
+  filter(!`Pre-vaccine COVID infection` | is.na(`Pre-vaccine COVID infection`))
+
+
+
+
+tib_ics_bl <- tib_ics %>%
+  left_join(tib_primary, by = "ID") %>%
+  filter(ICS_Date <= (`Dose 1`)) %>%
+  dplyr::select(
+    ID,
+    `Baseline ICS Date` = ICS_Date,
+    `Baseline Spep CD4` = S_pep_CD4_total,
+    `Baseline Spep CD8` = S_pep_CD8_total
+  ) %>%
+  group_by(ID) %>%
+  filter(`Baseline ICS Date` == min(`Baseline ICS Date`))
+tib_ics_d1 <- tib_ics %>%
+  left_join(tib_primary, by = "ID") %>%
+  filter(ICS_Date >= (`Dose 1` + 10), ICS_Date <= (`Dose 2`)) %>%
+  dplyr::select(
+    ID,
+    `Post-Dose 1 ICS Date` = ICS_Date,
+    `Post-Dose 1 Spep CD4` = S_pep_CD4_total,
+    `Post-Dose 1 Spep CD8` = S_pep_CD8_total
+  ) %>%
+  group_by(ID) %>%
+  filter(`Post-Dose 1 ICS Date` == min(`Post-Dose 1 ICS Date`))
+tib_ics_d2 <- tib_ics %>%
+  left_join(tib_primary, by = "ID") %>%
+  filter(ICS_Date >= (`Dose 2` + 7), (ICS_Date <= (`Dose 3`) | is.na(`Dose 3`))) %>%
+  dplyr::select(
+    ID,
+    `Post-Dose 2 ICS Date` = ICS_Date,
+    `Post-Dose 2 Spep CD4` = S_pep_CD4_total,
+    `Post-Dose 2 Spep CD8` = S_pep_CD8_total
+  ) %>%
+  group_by(ID) %>%
+  filter(`Post-Dose 2 ICS Date` == min(`Post-Dose 2 ICS Date`))
+
+tib_primary <- tib_primary %>%
+  left_join(tib_ics_bl, by = "ID") %>%
+  left_join(tib_ics_d1, by = "ID") %>%
+  left_join(tib_ics_d2, by = "ID")
+rm(tib_ics_bl)
+rm(tib_ics_d1)
+rm(tib_ics_d2)
+
+```
+
+```{r}
+save_fig <- function(plot, n, name, log = TRUE, hint = TRUE, pct = FALSE, logx = FALSE, vint = FALSE, gr = FALSE, ext = "pd") {
+  (plot +
+    theme_bw() +
+    theme(
+      axis.title.x = element_text(size = INT_SIG_SIZE*4.5),
+      axis.title.y = element_text(size = INT_SIG_SIZE*4.5),
+      axis.text.y = element_text(size = INT_SIG_SIZE*4),
+      title = element_text(size = INT_SIG_SIZE*4.5),
+      axis.text.x = element_text(angle = 45, hjust=1),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank()
+    ) +
+    scale_color_manual(values = vec_colors) +
+    scale_fill_manual(values = vec_colors) +
+    guides(color = FALSE, fill = FALSE, shape = FALSE) +
+    {if(log)
+      scale_y_log10(
+        breaks = trans_breaks("log10", function(x) 10^x),
+        labels = trans_format("log10", math_format(10^.x))
+      )
+    } +
+    {if(log)
+      annotation_logticks(sides = "l")
+    } +
+    {if(hint)
+      geom_hline(yintercept = 30, linetype='dotted')
+    } +
+    {if(logx)
+      scale_x_log10(
+        breaks = trans_breaks("log10", function(x) 10^x),
+        labels = trans_format("log10", math_format(10^.x))
+      )
+    } +
+    {if(logx)
+      annotation_logticks(sides = "b")
+    } +
+    {if(vint)
+      geom_vline(xintercept = 30, linetype='dotted')
+    } +
+    {if(gr)
+      facet_grid(~Group, scales = "free", space = "free")
+    } +
+    {if(pct)
+      scale_y_continuous(labels = scales::percent, limits=c(0,1))
+    }) %>%
+    ggsave(
+      plot = .,
+      get_file(sprintf("Fig_%s_%s", n, name), ext = ext), 
+      height = N_H/2, width = N_W/2
+    )
+}
+
+```
+
+1A: RBD titer vs Spike titer w linear correlation and R2, all timepoints and all patients
+
+```{r}
+(
+  tib_primary_all %>%
+    ggplot(aes(RBD, Spike)) +
+      geom_point() +
+      geom_smooth(method = "lm", formula = y ~ x) +
+      stat_cor(label.y = 5, label.x = 1.5) +
+      stat_regline_equation(label.y = 5.3, label.x = 1.5) 
+) %>%
+  save_fig("1A", "RBD_vs_Spike", logx = TRUE, vint = TRUE)
+
+```
+
+1C/E: Percent of patients who develop a seropositive response
+Bar graph
+X-axis: treatment groups
+Y-axis: percent of treatment group who become seropositive at any time point (RBD or spike is > 3x ULN / HD)
+Stats: compare each group to healthy donor group
+
+```{r Figure 1C - Patients with Seropositive Response}
+get_seropositivity <- function(rs, tc = TRUE, tib = tib_primary) {
+  rs <- ifelse(rs, "RBD", "Spike")
+  tc <- ifelse(tc, "Analysis category", "Cancer Type")
+  lvls <- c(vec_lvls[[tc]], vec_lvls[["Post-Infection"]])
+  
+  tib1 <- tib %>%
+    group_by(ID, across(all_of(tc))) %>%
+    filter(!is.na(across(all_of(sprintf("Post-Dose 2 %s", rs))))) %>%
+    summarise(Seropositive = c(across(all_of(sprintf("Post-Dose 2 %s", rs))) > 30)) %>%
+    mutate(
+      Group = "Post-Vaccination"
+    )
+  
+  tib2 <- tib1[grepl("HD", tib1[[tc]]),] %>%
+    bind_rows(
+      tib_primary_infection %>%
+        group_by(ID, `Analysis category`) %>%
+        summarise(Seropositive = max(across(all_of(rs))) > 30) %>%
+        rename_with(~tc, `Analysis category`)
+    ) %>%
+    mutate(
+      Group = "Post-Infection"
+    )
+  tib <- bind_rows(tib1, tib2) %>%
+    group_by(across(all_of(tc)), Group) %>%
+    summarise(
+      `TRUE` = sum(Seropositive),
+      `FALSE` = n() - sum(Seropositive),
+      Seropositivity = sum(Seropositive)/n()
+    )
+  tib[[tc]] <- factor(tib[[tc]], levels = lvls)
+  tib[["Group"]] <- factor(tib[["Group"]], levels = vec_lvls[["Group"]])
+  return(tib)
+}
+
+get_fisher <- function(comp, rs, tc, vax, tib) {
+  tib <- get_seropositivity(rs, tc, tib = tib) %>%
+    gather("Seropositive", "n", `FALSE`, `TRUE`) %>%
+    mutate(Seropositive = as.logical(Seropositive))
+  tc <- ifelse(tc, "Analysis category", "Cancer Type")
+  vax <- ifelse(vax, "Post-Vaccination", "Post-Infection")
+  tib[(tib[[tc]] == "HD" | tib[[tc]] == comp) &
+    tib[["Group"]] == vax,] %>%
+    dplyr::select(-Seropositivity, -Group) %>%
+    pivot_wider(names_from = tc, values_from = n) %>%
+    mutate_all(replace_na, 0) %>%
+    fisher.test() %>%
+    broom::tidy() %>%
+    pull(p.value) %>%
+    sprintf("HD vs %s: p = %f", comp, .) %>%
+    return()
+}
+
+for(rs in c(TRUE, FALSE)) {
+  for(tc in c(TRUE, FALSE)) {
+    cat <- ifelse(tc, "Analysis category", "Cancer Type")
+    ticks <- paste0("`", cat, "`")
+    title <- ifelse(tc, "Treatment Group", "Cancer Type")
+    fignum <- ifelse(tc, "C", "E")
+    fn <- ifelse(tc, "Tx", "Ca")
+    elisa <- ifelse(rs, "RBD", "Spike")
+    tib <- tib_primary_noinfx
+    (
+      get_seropositivity(rs, tc, tib) %>%
+        ggplot(aes_string(x = ticks, y = "Seropositivity", fill = ticks)) +
+          geom_bar(stat = "identity", colour="black") +
+          ggtitle(sprintf("%s Seropositivity by %s", elisa, title))
+    ) %>%
+      save_fig(
+        sprintf("1%s", fignum),
+        sprintf("%s_Seropositivity_%s", fn, elisa),
+        log = FALSE, pct = TRUE, gr = TRUE, hint = FALSE)
+
+    sapply(vec_lvls[[cat]][-1], get_fisher, rs, tc, TRUE, tib_primary) %>%
+      tibble(Comparisons = .) %>%
+      writexl::write_xlsx(
+        get_file(
+          sprintf("Fig_1%s_%s_Seropositivity_%s", fignum, fn, elisa),
+          ext = "x"
+        )
+      )
+  }
+  sapply(vec_lvls[["Post-Infection"]], get_fisher, rs, tc, FALSE, tib_primary) %>%
+    tibble(Comparisons = .) %>%
+    writexl::write_xlsx(
+      get_file(
+        sprintf("Fig_1CE_PriorInf_Seropositivity_%s", elisa),
+        ext = "x"
+      )
+    )
+}
+
+```
+
+
+1B/D: Spike and RBD IgG titers by treatment category - dose 2
+Boxplot w individual dots displaying maximum titer reached at any timepoint (dose 1 or 2) per patient
+X-axis: treatment group
+Y-axis: Max titer reached
+Stats: Compare each group to HD group
+
+```{r Figure 1B and 1D}
+fig1bd <- function(tib, tc) {
+  cat <- ifelse(tc, "Analysis category", "Cancer Type")
+  tg <- ifelse(tc, "Treatment Group", "Cancer Type")
+  fignum <- ifelse(tc, "B", "D")
+  fn <- ifelse(tc, "Tx", "Ca")
+  ticks <- paste0("`", cat, "`")
+  
+  grouping <- "`Analysis category`"
+  for (igg in c("RBD", "Spike")) {
+    title <- sprintf("%s IgG After Dose 2 By %s", igg, tg)
+    (
+      tib %>%
+        ggplot(aes_string(x = ticks, y = igg)) +
+          geom_boxplot(outlier.shape = NA, aes_string(color = ticks)) +
+          geom_jitter(width = 0.1, size = INT_SIG_SIZE, mapping = aes_string(color = ifelse(tc, "Subcategory", ticks))) +
+          geom_signif(comparisons = list(c("HD", "Post-Infection Cancer")), map_signif_level = fun_significance, margin_top = 0.05) +
+          geom_signif(comparisons = list(c("HD", "Post-Infection Non-Cancer"), c("Post-Infection Cancer", "Post-Infection Non-Cancer")), map_signif_level = fun_significance, margin_top = 0.10) +
+          geom_signif(comparisons = list(c("HD", ifelse(tc, "Not on Tx", "Heme"))), map_signif_level = fun_significance, margin_top = 0.05) +
+          geom_signif(comparisons = list(c("HD", ifelse(tc, "TKI", "Thoracic"))), map_signif_level = fun_significance, margin_top = 0.10) +
+          geom_signif(comparisons = list(c("HD", ifelse(tc, "B cell", "Skin"))), map_signif_level = fun_significance, margin_top = 0.15) +
+          geom_signif(comparisons = list(c("HD", ifelse(tc, "ChemoIO", "H&N"))), map_signif_level = fun_significance, margin_top = 0.20) +
+          geom_signif(comparisons = list(c("HD", ifelse(tc, "Chemo", "GU"))), map_signif_level = fun_significance, margin_top = 0.25) +
+          geom_signif(comparisons = list(c("HD", ifelse(tc, "IO", "GI"))), map_signif_level = fun_significance, margin_top = 0.30) +
+          {if(!tc) geom_signif(comparisons = list(c("HD", "Breast/Gyn")), map_signif_level = fun_significance, margin_top = 0.35) } +
+          ggtitle(title)
+    ) %>%
+      save_fig(
+        sprintf("1%s", fignum),
+        sprintf("%s_Titer_%s", fn, igg),
+        gr = TRUE
+      )
+  }
+}
+
+fun_get_1b <- function(tc) {
+  tc <- ifelse(tc, "Analysis category", "Cancer Type")
+  tib1b <- tib_primary %>%
+    dplyr::select(
+      ID,
+      all_of(tc),
+      Subcategory = `Analysis subcategory`,
+      RBD = `Post-Dose 2 RBD`,
+      Spike = `Post-Dose 2 Spike`,
+      Prior = `Pre-vaccine COVID infection`
+    ) %>%
+    filter(!is.na(RBD)) %>%
+    mutate(Group = "Post-Vaccination")
+  tib1binf <- tib1b %>%
+    filter(across(all_of(tc)) == "HD") %>%
+    bind_rows(
+      tib_primary_infection %>%
+      rename_with(~tc, `Analysis category`) %>%
+      dplyr::select(ID, all_of(tc), RBD, Spike)
+    ) %>%
+    mutate(Group = "Post-Infection")
+  tib1b <- bind_rows(tib1b, tib1binf) %>%
+    mutate(Group = factor(Group, levels = vec_lvls[["Group"]])) %>%
+    mutate(
+      Subcategory = case_when(
+        is.na(Subcategory) ~ "N/A",
+        !grepl("Analysis", tc) ~ "N/A",
+        TRUE ~ Subcategory
+      )
+    )
+  lvls <- c(vec_lvls[[tc]], vec_lvls[["Post-Infection"]])
+  tib1b[[tc]] <- factor(tib1b[[tc]], levels = lvls)
+  return(tib1b %>% filter(!Prior | is.na(Prior)))
+}
+
+for(tc in c(TRUE, FALSE)) {
+  fun_get_1b(tc) %>%
+    fig1bd(tc)
+}
+
+```
+
+
+```{r Figure S1B}
+figS1b <- function(tib, tc) {
+  cat <- ifelse(tc, "Analysis category", "Cancer Type")
+  tg <- ifelse(tc, "Treatment Group", "Cancer Type")
+  fignum <- ifelse(tc, "B", "D")
+  fn <- ifelse(tc, "Tx", "Ca")
+  ticks <- paste0("`", cat, "`")
+  
+  grouping <- "`Analysis category`"
+  for (igg in c("RBD", "Spike")) {
+    title <- sprintf("%s IgG After Dose 2 By %s", igg, tg)
+    (
+      tib %>%
+        ggplot(aes_string(x = "DPV", y = igg, color = ticks, group = "ID")) +
+          geom_point() +
+          geom_line() +
+          ggtitle(title)
+    ) %>%
+      save_fig(
+        "S1B",
+        sprintf("%s_DPV_by_%s", igg, fn)
+      )
+  }
+}
+
+fun_get_S1b <- function(tc) {
+  tc <- ifelse(tc, "Analysis category", "Cancer Type")
+  tibS1b <- tib_primary_all %>%
+    filter(
+      !is.na(`Dose 1`), !is.na(`Dose 2`),
+      `Pre-vaccine COVID infection` == "NO" | is.na(`Pre-vaccine COVID infection`),
+      `ELISA Date` >= (`Dose 1` + 10) & ((`ELISA Date` <= `Dose 3`) | is.na(`Dose 3`)),
+      !is.na(RBD) & !is.na(Spike)
+    ) %>%
+    dplyr::select(
+      ID,
+      DPV = ELISA_DPV,
+      all_of(tc),
+      Subcategory = `Analysis subcategory`,
+      RBD,
+      Spike
+    )
+  tibS1b[[tc]] <- factor(tibS1b[[tc]], levels = vec_lvls[[tc]])
+  return(tibS1b)
+}
+
+for(tc in c(TRUE, FALSE)) {
+  fun_get_S1b(tc) %>%
+    figS1b(tc)
+}
+
+```
+
+1E: Spike and RBD IgG titers by patient age
+Scatter plot 
+X-axis = pt age
+Y-axis = max IgG titer at any timepoint
+Color = treatment category
+Stats: linear correlation and R2
+
+1F: Spike and RBD IgG titers by gender
+Box plot
+X-axis = gender
+Y-axis = max IgG titer at any timepoint
+Stats: Compare M vs F
+
+1G: Titers by cancer stage (redcap) 
+Boxplot w individual dots displaying maximum titer reached at any timepoint (dose 1 or 2) per patient
+X-axis: cancer stage
+Y-axis: Max titer reached
+Stats: Compare each group to NED or HD
+
+1H: Titers by ECOG PS (redcap) 
+Boxplot w individual dots displaying maximum titer reached at any timepoint (dose 1 or 2) per patient
+X-axis: ECOG
+Y-axis: Max titer reached
+Stats: Compare each group to HD
+
+```{r Figure 1E-H}
+fig2abcd <- function(tib, x, fig, scatter = TRUE) {
+  for(igg in c("RBD", "Spike")) {
+    (
+      tib %>%
+        ggplot(aes_string(x = x, y = igg, color = x)) +
+          {if(scatter) geom_point(aes(color = `Analysis category`))} +
+          {if(scatter) geom_smooth(method = "lm", se=FALSE, color="black", formula = y ~ x)} +
+          {if(scatter) stat_cor(label.y = 5)} +
+          {if(scatter) stat_regline_equation(label.y = 5.3)} +
+          {if(!scatter) geom_boxplot(outlier.shape = NA)} +
+          {if(!scatter) geom_jitter(width = 0.1, size = INT_SIG_SIZE)} +
+          {if(x == "Sex") geom_signif(comparisons = list(c("Female", "Male"), c("HD Female", "HD Male")), map_signif_level = fun_significance, margin_top = 0.05)} +
+          {if(x == "Steroids") geom_signif(comparisons = list(c("HD", "No"), c("No", "Yes")), map_signif_level = fun_significance, margin_top = 0.05)} +
+          {if(x == "Steroids") geom_signif(comparisons = list(c("HD", "Yes")), map_signif_level = fun_significance, margin_top = 0.10)} +
+          {if(x == "Stage") geom_signif(comparisons = list(c("HD", "I")), map_signif_level = fun_significance, margin_top = 0.05)} +
+          {if(x == "Stage") geom_signif(comparisons = list(c("HD", "II")), map_signif_level = fun_significance, margin_top = 0.10)} +
+          {if(x == "Stage") geom_signif(comparisons = list(c("HD", "III")), map_signif_level = fun_significance, margin_top = 0.15)} +
+          {if(x == "Stage") geom_signif(comparisons = list(c("HD", "IV")), map_signif_level = fun_significance, margin_top = 0.20)} +
+          {if(x == "ECOG") geom_signif(comparisons = list(c("HD", "0"), c("0", "1")), map_signif_level = fun_significance, margin_top = 0.05)} +
+          {if(x == "ECOG") geom_signif(comparisons = list(c("HD", "1")), map_signif_level = fun_significance, margin_top = 0.10)} +
+          {if(x == "ECOG") geom_signif(comparisons = list(c("HD", "2")), map_signif_level = fun_significance, margin_top = 0.15)} +
+          {if(x == "ECOG") geom_signif(comparisons = list(c("0", "2")), map_signif_level = fun_significance, margin_top = 0.20)} +
+          ggtitle(sprintf("Max %s IgG by %s", igg, x))
+    ) %>%
+      save_fig(fig, sprintf("Max_%s_IgG_vs_%s", igg, x))
+  }
+}
+
+tib_fig2abcd <- tib_primary_noinfx %>%
+  mutate(
+    Stage = case_when(
+      grepl("IV", stage) ~ "IV",
+      grepl("III", stage) ~ "III",
+      grepl("II", stage) ~ "II",
+      grepl("I", stage) ~ "I",
+      TRUE ~ "HD"
+    ) %>% factor(levels = c("HD", "I", "II", "III", "IV")),
+    ECOG = factor(ECOG, levels = c("HD", "0", "1", "2")),
+    Steroids = as.character(Steroids),
+    Steroids = factor(
+      case_when(
+        `Analysis category` == "HD" ~ "HD",
+        is.na(Steroids) ~ "No",
+        TRUE ~ Steroids
+      ),
+      levels = c("HD", "No", "Yes")
+    ),
+    Sex = case_when(
+      Stage == "HD" ~ paste("HD", Sex),
+      TRUE ~ Sex
+    ) %>% factor(levels = c("HD Female", "HD Male", "Female", "Male"))
+  ) %>%
+  filter(!is.na(`Analysis category`)) %>%
+  rename(RBD = `Post-Dose 2 RBD`, Spike = `Post-Dose 2 Spike`)
+
+fig2abcd(tib_fig2abcd, "Age", "2A")
+fig2abcd(tib_fig2abcd, "Sex", "2B", FALSE)
+fig2abcd(tib_fig2abcd, "ECOG", "2C", FALSE)
+fig2abcd(tib_fig2abcd %>% filter(`Cancer Type` != "Heme"), "Stage", "2D", FALSE)
+fig2abcd(tib_fig2abcd, "Steroids", "2E", FALSE)
+```
+
+```{r}
+vec_prior_infection <- tib_primary %>%
+  filter(`Pre-vaccine COVID infection`) %>%
+  pull(ID)
+
+tib_D1 <- tib_primary_all %>%
+  mutate(DPV = 0) %>%
+  dplyr::select(ID, DPV) %>%
+  mutate(
+    Category = "Vaccination",
+    Group = "Dose 1",
+    RBD = 10,
+    Spike = 10
+  ) %>%
+  unique()
+
+
+tib_D2D3 <- tib_primary_all %>%
+  filter(`Dose 2` <= `ELISA Date`, (`Dose 3` >= `ELISA Date` | is.na(`Dose 3`))) %>%
+  mutate(DPV = as.integer(as_date(`ELISA Date`) - as_date(`Dose 1`))) %>%
+  dplyr::select(ID, DPV, RBD, Spike) %>%
+  mutate(
+    Category = "ELISA",
+    Group = "Dose 2"
+  ) %>%
+  unique()
+
+get_log_value <- function(elisa, d1, d2, di, elisa_base) {
+  elisa_base <- replace_na(elisa_base, 10)
+  10^(
+    log10(elisa_base) +
+      (log10(elisa) - log10(elisa_base)) *
+      (di - d1) /
+      (d2 - d1)
+    )
+}
+
+tib_D2 <- tib_primary_all %>%
+  mutate(DPV = as.integer(as_date(`Dose 2`) - as_date(`Dose 1`))) %>%
+  dplyr::select(ID, DPV) %>%
+  unique() %>%
+  left_join(
+    tib_D1 %>%
+      dplyr::select(ID, RBD, Spike, DPV) %>%
+      left_join(
+        tib_D2D3 %>% 
+          dplyr::select(ID, RBD, Spike, DPV) %>%
+          group_by(ID) %>%
+          filter(DPV == min(DPV)),
+        suffix = c("1", "2"),
+        by = "ID"),
+    by= "ID"
+  ) %>%
+  mutate(
+    RBD = get_log_value(RBD2, DPV1, DPV2, DPV, RBD1),
+    Spike = get_log_value(Spike2, DPV1, DPV2, DPV, Spike1)
+  ) %>%
+  dplyr::select(ID, DPV, RBD, Spike) %>%
+  mutate(
+    Category = "Vaccination",
+    Group = "Dose 2"
+  )
+
+tib_pD3 <- tib_primary_all %>%
+  filter(!is.na(`Dose 3`) & `Dose 3` < `ELISA Date`) %>%
+  mutate(DPV = as.integer(as_date(`ELISA Date`) - as_date(`Dose 1`))) %>%
+  dplyr::select(ID, DPV, RBD, Spike) %>%
+  unique() %>%
+  mutate(
+    Category = "ELISA",
+    Group = "Dose 3"
+  )
+
+tib_D3 <- tib_primary_all %>%
+  filter(!is.na(`Dose 3`) & `Dose 3` < `ELISA Date`) %>%
+  mutate(DPV = as.integer(as_date(`Dose 3`) - as_date(`Dose 1`))) %>%
+  dplyr::select(ID, DPV) %>%
+  unique() %>%
+  left_join(
+    tib_pD3 %>%
+      dplyr::select(ID, RBD, Spike, DPV) %>%
+      left_join(
+        tib_primary_all %>%
+          filter(!is.na(`Dose 3`) & `Dose 3` > `ELISA Date`) %>%
+          group_by(ID) %>%
+          mutate(DPV = as.integer(as_date(`ELISA Date`) - as_date(`Dose 1`))) %>%
+          filter(DPV == max(DPV)) %>%
+          dplyr::select(ID, RBD, Spike, DPV),
+        suffix = c("1", "2"),
+        by = "ID"),
+    by= "ID"
+  ) %>%
+  mutate(
+    RBD = get_log_value(RBD2, DPV1, DPV2, DPV, RBD1),
+    Spike = get_log_value(Spike2, DPV1, DPV2, DPV, Spike1)
+  ) %>%
+  dplyr::select(ID, DPV, RBD, Spike) %>%
+  mutate(
+    Category = "Vaccination",
+    Group = "Dose 3"
+  )
+
+tib_Dall <- bind_rows(
+  tib_D1,
+  tib_D2 %>% mutate(Category = "End", Group = "Dose 1"),
+  tib_D2,
+  tib_D2D3
+) %>%
+  filter(!(ID %in% vec_prior_infection))
+
+plot_all <- function(elisa, d1 = TRUE, d3 = FALSE, tib = tib_Dall) {
+  if(!d1)
+    tib <- tib %>% filter(Group != "Dose 1")
+  if(d3)
+    tib <- tib %>% filter(ID %in% (tib %>% filter(Group == "Dose 3", Category == "ELISA") %>% pull(ID)))
+  (tib %>%
+    ggplot(aes_string(x = "DPV", y = elisa, group = "ID", color = "Group")) +
+      geom_point(aes(shape = Category)) +
+      geom_line() +
+      theme_bw() +
+      theme(
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(size = INT_SIG_SIZE*4.5),
+        axis.text.y = element_text(size = INT_SIG_SIZE*4),
+        title = element_text(size = INT_SIG_SIZE*4.5),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+      ) +
+      scale_shape_manual(values = c("Vaccination" = 4, "End" = NA, "ELISA" = 16)) +
+      guides(color = FALSE, fill = FALSE, shape = FALSE) +
+      scale_y_log10(
+        breaks = trans_breaks("log10", function(x) 10^x),
+        labels = trans_format("log10", math_format(10^.x))
+      )) %>%
+    ggsave(
+      plot = .,
+      get_file(
+        sprintf(
+          "Fig_3A_DPV_%s%s%s",
+          elisa,
+          ifelse(d1, "", "_NoD1"),
+          ifelse(d3, "_D3Only", "")
+        ),
+        ext = "pd"
+      ), 
+      height = N_H/2, width = N_W/2
+    )
+}
+
+plot_all("RBD", d1 = TRUE, d3 = FALSE)
+plot_all("RBD", d1 = FALSE, d3 = FALSE)
+plot_all("Spike", d1 = TRUE, d3 = FALSE)
+plot_all("Spike", d1 = FALSE, d3 = FALSE)
+
+```
+
+4B/C: CD4/CD8 by treatment category - dose 2
+Boxplot w individual dots displaying maximum titer reached at any timepoint (dose 1 or 2) per patient
+X-axis: treatment group
+Y-axis: Max titer reached
+Stats: Compare each group to HD group
+
+```{r Figure 4B/C}
+fig4bc <- function(tib, tc) {
+  cat <- ifelse(tc, "Analysis category", "Cancer Type")
+  tg <- ifelse(tc, "Treatment Group", "Cancer Type")
+  fignum <- ifelse(tc, "B", "C")
+  fn <- ifelse(tc, "Tx", "Ca")
+  ticks <- paste0("`", cat, "`")
+  
+  grouping <- "`Analysis category`"
+  for (ics in c("4", "8")) {
+    title <- sprintf("CD%s After Dose 2 By %s", ics, tg)
+    (
+      tib %>%
+        ggplot(aes_string(x = ticks, y = sprintf("`Post-Dose 2 Spep CD%s`", ics))) +
+          geom_boxplot(outlier.shape = NA, mapping = aes_string(color = ticks)) +
+          geom_jitter(width = 0.1, size = INT_SIG_SIZE, mapping = aes_string(color = ifelse(tc, "Subcategory", ticks))) +
+          geom_signif(comparisons = list(c("HD", ifelse(tc, "Not on Tx", "Heme"))), map_signif_level = fun_significance, margin_top = 0.05) +
+          geom_signif(comparisons = list(c("HD", ifelse(tc, "TKI", "Thoracic"))), map_signif_level = fun_significance, margin_top = 0.10) +
+          geom_signif(comparisons = list(c("HD", ifelse(tc, "B cell", "Skin"))), map_signif_level = fun_significance, margin_top = 0.15) +
+          geom_signif(comparisons = list(c("HD", ifelse(tc, "ChemoIO", "H&N"))), map_signif_level = fun_significance, margin_top = 0.20) +
+          geom_signif(comparisons = list(c("HD", ifelse(tc, "Chemo", "GU"))), map_signif_level = fun_significance, margin_top = 0.25) +
+          geom_signif(comparisons = list(c("HD", ifelse(tc, "IO", "GI"))), map_signif_level = fun_significance, margin_top = 0.30) +
+          {if(!tc) geom_signif(comparisons = list(c("HD", "Breast/Gyn")), map_signif_level = fun_significance, margin_top = 0.35) } +
+          ggtitle(title)
+    ) %>%
+      save_fig(
+        sprintf("4%s", fignum),
+        sprintf("%s_ICS_CD%s", fn, ics),
+        hint = FALSE
+      )
+  }
+}
+
+fun_get_4bc <- function(tc) {
+  tc <- ifelse(tc, "Analysis category", "Cancer Type")
+  tib1b <- tib_primary %>%
+    dplyr::select(
+      ID,
+      all_of(tc),
+      Subcategory = `Analysis subcategory`,
+      `Post-Dose 2 Spep CD4`,
+      `Post-Dose 2 Spep CD8`,
+      Prior = `Pre-vaccine COVID infection`
+    ) %>%
+    filter(!is.na(`Post-Dose 2 Spep CD4`)) %>%
+    mutate(
+      Subcategory = case_when(
+        is.na(Subcategory) ~ "N/A",
+        !grepl("Analysis", tc) ~ "N/A",
+        TRUE ~ Subcategory
+      )
+    )
+  tib1b[[tc]] <- factor(tib1b[[tc]], levels = vec_lvls[[tc]])
+  return(tib1b)
+}
+
+for(tc in c(TRUE, FALSE)) {
+  fun_get_4bc(tc) %>%
+    fig4bc(tc)
+}
+
+```
+
+
+```{r}
+for(rs in c("RBD", "Spike")) {
+  for(ics in c("4", "8")) {
+    (
+      tib_elisa_ics %>%
+        ggplot(aes_string(sprintf("S_pep_CD%s_total", ics), rs)) +
+          geom_point() +
+          geom_smooth(method = "lm", formula = y ~ x) +
+          stat_cor(label.y = 5) +
+          stat_regline_equation(label.y = 5.3) 
+    ) %>%
+      save_fig("4E", sprintf("%s_vs_CD%s", rs, ics), logx = TRUE)
+    
+  }
+}
+
+tib_primary %>%
+  writexl::write_xlsx(get_file("SortedData.w.ICS", "x"))
+
+```
+
+
+
+1C/E: Percent of patients who develop a seropositive response
+Bar graph
+X-axis: treatment groups
+Y-axis: percent of treatment group who become seropositive at any time point (RBD or spike is > 3x ULN / HD)
+Stats: compare each group to healthy donor group
+
+```{r Figure 1C - Patients with Seropositive Response}
+get_tcpositivity <- function(ics, tc = TRUE, tib = tib_primary) {
+  cd <- sprintf("CD%d", ics)
+  tc <- ifelse(tc, "Analysis category", "Cancer Type")
+  tib <- tib %>%
+    group_by(ID, across(all_of(tc))) %>%
+    filter(!is.na(across(all_of(sprintf("Post-Dose 2 Spep %s", cd))))) %>%
+    summarise(Positive = c(across(all_of(sprintf("Post-Dose 2 Spep %s", cd))) > 0)) %>%
+    group_by(across(all_of(tc))) %>%
+    summarise(
+      `TRUE` = sum(Positive),
+      `FALSE` = n() - sum(Positive),
+      Positivity = sum(Positive)/n()
+    )
+  tib[[tc]] <- factor(tib[[tc]], levels = vec_lvls[[tc]])
+  return(tib)
+}
+
+get_fisher_ics <- function(comp, ics, tc, tib) {
+  tib <- get_tcpositivity(ics, tc, tib = tib) %>%
+    gather("Positive", "n", `FALSE`, `TRUE`) %>%
+    mutate(Positive = as.logical(Positive))
+  tc <- ifelse(tc, "Analysis category", "Cancer Type")
+  tib[(tib[[tc]] == "HD" | tib[[tc]] == comp),] %>%
+    dplyr::select(-Positivity) %>%
+    pivot_wider(names_from = tc, values_from = n) %>%
+    mutate_all(replace_na, 0) %>%
+    fisher.test() %>%
+    broom::tidy() %>%
+    pull(p.value) %>%
+    sprintf("HD vs %s: p = %f", comp, .) %>%
+    return()
+}
+
+for(cd in c(TRUE, FALSE)) {
+  for(tc in c(TRUE, FALSE)) {
+    cat <- ifelse(tc, "Analysis category", "Cancer Type")
+    ticks <- paste0("`", cat, "`")
+    title <- ifelse(tc, "Treatment Group", "Cancer Type")
+    fignum <- ifelse(tc, "F", "G")
+    fn <- ifelse(tc, "Tx", "Ca")
+    ics <- ifelse(cd, 4, 8)
+    (
+      get_tcpositivity(ics, tc, tib_primary) %>%
+        ggplot(aes_string(x = ticks, y = "Positivity", fill = ticks)) +
+          geom_bar(stat = "identity", colour="black") +
+          ggtitle(sprintf("CD%s T Cell Positivity by %s", ics, title))
+    ) %>%
+      save_fig(
+        sprintf("4%s", fignum),
+        sprintf("%s_CD%s_T_Cell_Positivity", fn, ics),
+        log = FALSE, pct = TRUE, gr = FALSE, hint = FALSE)
+
+    sapply(vec_lvls[[cat]][-1], get_fisher_ics, ics, tc, tib_primary) %>%
+      tibble(Comparisons = .) %>%
+      writexl::write_xlsx(
+        get_file(
+          sprintf("Fig_4%s_%s_%s_T_Cell_Positivity", fignum, fn, ics),
+          ext = "x"
+        )
+      )
+  }
+}
+
+```
+
+
+
+
